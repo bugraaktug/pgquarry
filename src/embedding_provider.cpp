@@ -1,0 +1,33 @@
+// Adapted from walkrie (Apache-2.0): src/embedding_provider.cpp
+#include "embedding_provider.hpp"
+
+#include "embedding_config.hpp"
+#include "llama_provider.hpp"
+
+#include <stdexcept>
+
+namespace pgquarry 
+{
+
+std::shared_ptr<EmbeddingProvider> make_embedding_provider(const EmbeddingConfig& cfg)
+{
+    if (cfg.provider == "llama") {
+        return std::make_shared<LlamaProvider>(cfg);
+    }
+
+    throw std::runtime_error(
+        "make_embedding_provider: unknown provider '" + cfg.provider + "' — "
+        "v0 only implements 'llama'");
+}
+
+std::vector<std::vector<float>> EmbeddingProvider::embed_batch(const std::vector<std::string>& texts)
+{
+    std::vector<std::vector<float>> results;
+    results.reserve(texts.size());
+    for (const auto& t : texts) {
+        results.push_back(embed(t));
+    }
+    return results;
+}
+
+} // namespace pgquarry
