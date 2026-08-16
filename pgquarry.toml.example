@@ -3,7 +3,8 @@
 
 [worker]
 conninfo         = "host=localhost port=5432 dbname=qdb user=quser password=quser1234"
-model_path       = "/var/lib/pgquarry/models/bge-m3-Q4_K_M.gguf"
+#model_path       = "/var/lib/pgquarry/models/bge-m3-Q4_K_M.gguf"
+model_path       = "/home/rockylinux/models/bge-m3/bge-m3-Q4_K_M.gguf"
 dimensions       = 1024
 n_threads        = 4
 n_ctx            = 512
@@ -15,19 +16,18 @@ poll_interval_ms = 250
 purge_after    = "7d"    # delete status='done' rows older than this; omit/"0" = keep forever
 purge_verbose  = false   # when true, log id/status/created_at for every row a sweep deletes
 
-# same-table write-back: target_table/target_id_column default to source/id_column
-[[table]]
-source       = "docs"
-embed_column = "body"
-id_column    = "id"
-target_column = "embedding"
+[logging]
+log_file    = "/tmp/pgquarry/worker.log"
+log_level   = "info"     # trace|debug|info|warn|error|critical|off — debug logs claim/write-back detail per job
+max_size_mb = 10         # rotate the active log file once it crosses this size
+max_files   = 3          # rotated files kept, oldest deleted beyond this
 
-# cross-table write-back: worker UPSERTs into a separate table instead of
-# augmenting the source row
-[[table]]
-source            = "docs_chunks"
-embed_column      = "chunk_text"
-id_column         = "id"
-target_table      = "chunk_embeddings"
-target_column     = "embedding"
-target_id_column  = "chunk_id"
+# Table watches aren't configured here — register them from SQL instead,
+# after `CREATE EXTENSION pgquarry;`:
+#
+#   -- same-table write-back: target_table/target_id_column default to source/id_column
+#   SELECT pgquarry.watch('docs', 'body', 'id', NULL, 'embedding');
+#
+#   -- cross-table write-back: worker UPSERTs into a separate table instead
+#   -- of augmenting the source row
+#   SELECT pgquarry.watch('docs_chunks', 'chunk_text', 'id', 'chunk_embeddings', 'embedding', 'chunk_id');

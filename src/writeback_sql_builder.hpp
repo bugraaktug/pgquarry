@@ -6,11 +6,11 @@ namespace pgquarry {
 
 struct TableMapping;
 
-// Builds the parameterized write-back SQL for a [[table]] mapping: $1 is
-// always the embedding (cast to ::vector), $2 the source row's id. Table and
-// column identifiers come straight from pgquarry.toml (operator config, not
-// client input) and are interpolated directly — same precedent as walkrie's
-// PgSqlBuilder for its pgvector sink.
+// Builds the parameterized write-back SQL for a pgquarry.watched_tables
+// mapping: $1 is always the embedding (cast to ::vector), $2 the source row's
+// id. Table and column identifiers come from pgquarry.watch() calls (operator
+// config, not client input) and are interpolated directly — same precedent as
+// walkrie's PgSqlBuilder for its pgvector sink.
 class WritebackSqlBuilder
 {
 public:

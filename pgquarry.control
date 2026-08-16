@@ -1,0 +1,4 @@
+comment = 'pgquarry: Postgres-native async job queue for LLM embedding inference'
+default_version = '1.0'
+relocatable = false
+requires = 'vector'

@@ -15,10 +15,8 @@
 
 namespace pgquarry {
 
-// One [[table]] entry: watches source.embed_column for INSERT/UPDATE and
-// writes the resulting vector into target_table.target_column, keyed by
-// target_id_column. target_table/target_id_column default to source/id_column
-// (same-table write-back) when left unset in the TOML.
+/// One pgquarry.watched_tables row, registered via pgquarry.watch(): watches source.embed_column for
+/// INSERT/UPDATE, writes the resulting vector into target_table.target_column keyed by target_id_column.
 struct TableMapping
 {
     std::string source;
@@ -29,6 +27,14 @@ struct TableMapping
     std::string target_id_column;
 
     bool same_table() const { return target_table == source; }
+};
+
+struct LoggingConfig
+{
+    std::string log_file      = "/tmp/pgquarry/worker.log";
+    std::string log_level     = "info"; // trace|debug|info|warn|error|critical|off
+    int         max_size_mb   = 10;     // rotate once the active file crosses this size
+    int         max_files     = 3;      // rotated files kept, oldest deleted beyond this
 };
 
 struct RetentionConfig
@@ -72,7 +78,7 @@ struct AppConfig
     EmbeddingConfig    embedding;
     int                poll_interval_ms = 1000;
     RetentionConfig    retention;
-    std::vector<TableMapping> tables;
+    LoggingConfig      logging;
 
     std::vector<std::string> validate() const
     {
@@ -111,29 +117,14 @@ struct AppConfig
                               "'7d', '12h', '30m', '45s' (got '" + retention.purge_after + "')");
         }
 
-        if (tables.empty()) {
-            errors.push_back("[[table]] at least one table mapping is required");
+        static const std::vector<std::string> kLogLevels =
+            { "trace", "debug", "info", "warn", "error", "critical", "off" };
+        if (std::find(kLogLevels.begin(), kLogLevels.end(), logging.log_level) == kLogLevels.end()) {
+            errors.push_back("[logging] log_level must be one of trace|debug|info|warn|error|critical|off "
+                              "(got '" + logging.log_level + "')");
         }
-
-        std::vector<std::string> seen_sources;
-        for (size_t i = 0; i < tables.size(); ++i) {
-            const auto& t = tables[i];
-            const std::string ctx = "[table][" + std::to_string(i) + "]";
-
-            if (t.source.empty())       errors.push_back(ctx + " source is required");
-            if (t.embed_column.empty()) errors.push_back(ctx + " embed_column is required");
-            if (t.id_column.empty())    errors.push_back(ctx + " id_column is required");
-            if (t.target_column.empty()) errors.push_back(ctx + " target_column is required");
-
-            if (!t.source.empty()) {
-                if (std::find(seen_sources.begin(), seen_sources.end(), t.source) != seen_sources.end()) {
-                    errors.push_back(ctx + " duplicate source '" + t.source + "' — pgquarry only "
-                                      "supports one [[table]] mapping per source table in v1");
-                } else {
-                    seen_sources.push_back(t.source);
-                }
-            }
-        }
+        if (logging.max_size_mb <= 0) errors.push_back("[logging] max_size_mb must be > 0");
+        if (logging.max_files <= 0)   errors.push_back("[logging] max_files must be > 0");
 
         return errors;
     }
@@ -182,19 +173,11 @@ inline AppConfig load_config(const std::string& path)
         cfg.retention.purge_verbose = bl(r,  "purge_verbose", cfg.retention.purge_verbose);
     }
 
-    if (auto* arr = tbl["table"].as_array()) {
-        for (auto& elem : *arr) {
-            if (auto* t = elem.as_table()) {
-                TableMapping m;
-                m.source            = str(t, "source",            m.source);
-                m.embed_column      = str(t, "embed_column",      m.embed_column);
-                m.id_column         = str(t, "id_column",         m.id_column);
-                m.target_table      = str(t, "target_table",      m.source);       // default: same table
-                m.target_column     = str(t, "target_column",     m.target_column);
-                m.target_id_column  = str(t, "target_id_column",  m.id_column);    // default: same id column
-                cfg.tables.push_back(std::move(m));
-            }
-        }
+    if (auto* l = tbl["logging"].as_table()) {
+        cfg.logging.log_file    = str(l, "log_file",    cfg.logging.log_file);
+        cfg.logging.log_level   = str(l, "log_level",   cfg.logging.log_level);
+        cfg.logging.max_size_mb = i32(l, "max_size_mb", cfg.logging.max_size_mb);
+        cfg.logging.max_files   = i32(l, "max_files",   cfg.logging.max_files);
     }
 
     return cfg;

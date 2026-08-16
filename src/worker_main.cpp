@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include "config.hpp"
@@ -19,20 +19,21 @@
 namespace
 {
 
-// v1: still a static path — log_file/log_level/rotation config is not part
-// of pgquarry.toml yet (see walkrie's init_logger() for the TOML-driven
-// version this could grow into later).
-constexpr const char* kLogPath = "/tmp/pgquarry/worker.log";
-
-void init_logger()
+// Config isn't loaded yet when this runs (log_file/log_level are themselves
+// config), so failures here only ever reach stderr.
+void init_logger(const pgquarry::LoggingConfig& cfg)
 {
     try {
-        std::filesystem::create_directories(std::filesystem::path(kLogPath).parent_path());
-        auto file_logger = spdlog::basic_logger_mt("pgquarry", kLogPath);
+        std::filesystem::create_directories(std::filesystem::path(cfg.log_file).parent_path());
+        auto file_logger = spdlog::rotating_logger_mt(
+            "pgquarry", cfg.log_file,
+            static_cast<size_t>(cfg.max_size_mb) * 1024 * 1024, cfg.max_files);
         spdlog::set_default_logger(file_logger);
+        spdlog::set_level(spdlog::level::from_str(cfg.log_level));
         spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
         spdlog::flush_every(std::chrono::seconds(3));
-        spdlog::info("[worker] logger initialized — file={}", kLogPath);
+        spdlog::info("[worker] logger initialized — file={}, level={}, max_size_mb={}, max_files={}",
+                     cfg.log_file, cfg.log_level, cfg.max_size_mb, cfg.max_files);
     } catch (const spdlog::spdlog_ex& e) {
         std::cerr << "logger initialization failed: " << e.what() << "\n";
     }
@@ -43,8 +44,8 @@ void print_usage(const char* argv0)
     std::cerr <<
         "Usage: " << argv0 << " --config <pgquarry.toml path>\n"
         "\n"
-        "See pgquarry.toml.example for the config file format ([worker], "
-        "[retention], and one or more [[table]] entries).\n";
+        "See pgquarry.toml.example for the config file format ([worker] and "
+        "[retention] — table watches are registered via SQL, see pgquarry.watch()).\n";
 }
 
 volatile std::sig_atomic_t g_shutdown = 0;
@@ -55,12 +56,20 @@ void handle_signal(int) { g_shutdown = 1; }
 // no dedicated interval in pgquarry.toml, so this is a fixed default.
 constexpr auto kPurgeCheckInterval = std::chrono::seconds(60);
 
+std::string join_sources(const std::unordered_map<std::string, pgquarry::TableMapping>& mapping)
+{
+    std::string joined;
+    for (const auto& [source, _] : mapping) {
+        if (!joined.empty()) joined += ", ";
+        joined += source;
+    }
+    return joined.empty() ? "(none)" : joined;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
-    init_logger();
-
     std::string config_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -83,13 +92,16 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // log_file/log_level live in this same config, so the logger can't come up until after this parses.
     pgquarry::AppConfig cfg;
     try {
         cfg = pgquarry::load_config(config_path);
     } catch (const std::exception& e) {
-        spdlog::error("[worker] {}", e.what());
+        std::cerr << "[worker] " << e.what() << "\n";
         return 1;
     }
+
+    init_logger(cfg.logging);
 
     auto errors = cfg.validate();
     if (!errors.empty()) {
@@ -104,6 +116,7 @@ int main(int argc, char** argv)
     try {
         provider = pgquarry::make_embedding_provider(cfg.embedding);
         provider->init();
+        spdlog::debug("[worker] embedding provider initialized: {} ({} dims)", provider->name(), provider->dimensions());
     } catch (const std::exception& e) {
         spdlog::error("[worker] failed to initialize embedding provider: {}", e.what());
         return 1;
@@ -117,23 +130,24 @@ int main(int argc, char** argv)
     }
 
     pgquarry::JobStore store(cfg.conninfo);
+    std::unordered_map<std::string, pgquarry::TableMapping> mapping_by_source;
     try {
         store.connect();
-        store.sync_watched_tables(cfg.tables);
+        spdlog::debug("[worker] connected to database");
+        /// watched_tables (populated via pgquarry.watch()) is the worker's write-back mapping source.
+        for (auto& t : store.load_watched_tables()) mapping_by_source.emplace(t.source, std::move(t));
+        spdlog::info("[worker] watching {} table(s): {}", mapping_by_source.size(), join_sources(mapping_by_source));
     } catch (const std::exception& e) {
         spdlog::error("[worker] {}", e.what());
         return 1;
     }
-
-    std::unordered_map<std::string, pgquarry::TableMapping> mapping_by_source;
-    for (const auto& t : cfg.tables) mapping_by_source.emplace(t.source, t);
 
     std::optional<std::string> purge_interval = pgquarry::parse_purge_after(cfg.retention.purge_after);
     auto last_purge_check = std::chrono::steady_clock::now();
 
     spdlog::info("[worker] ready — provider={}, dimensions={}, batch_size={}, poll_interval_ms={}, tables={}",
                  provider->name(), provider->dimensions(), cfg.embedding.max_batch_size,
-                 cfg.poll_interval_ms, cfg.tables.size());
+                 cfg.poll_interval_ms, mapping_by_source.size());
 
     while (!g_shutdown) {
         std::vector<pgquarry::JobStore::ClaimedJob> claimed;
@@ -148,6 +162,15 @@ int main(int argc, char** argv)
         if (claimed.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cfg.poll_interval_ms));
         } else {
+            spdlog::debug("[worker] claimed {} job(s): {}", claimed.size(), [&claimed] {
+                std::string ids;
+                for (const auto& job : claimed) {
+                    if (!ids.empty()) ids += ", ";
+                    ids += std::to_string(job.id) + (job.source_table ? "@" + *job.source_table : "@(ad hoc)");
+                }
+                return ids;
+            }());
+
             std::vector<std::string> texts;
             texts.reserve(claimed.size());
             for (const auto& job : claimed) texts.push_back(job.input_text);
@@ -169,6 +192,7 @@ int main(int argc, char** argv)
             }
 
             int written = 0;
+            bool mapping_refreshed = false; // reload watched_tables at most once per batch on a cache miss
             for (size_t i = 0; i < vectors.size(); ++i) {
                 const auto& job = claimed[i];
                 if (vectors[i].empty()) {
@@ -176,17 +200,45 @@ int main(int argc, char** argv)
                     continue;
                 }
 
-                auto it = mapping_by_source.find(job.source_table);
+                if (!job.source_table.has_value()) {
+                    // Ad hoc job (pgquarry.embed_async()) — no source table, result goes into the job row itself.
+                    try {
+                        store.write_ad_hoc_result(job.id, vectors[i]);
+                        ++written;
+                        spdlog::debug("[worker] job {} (ad hoc) written to jobs.result", job.id);
+                    } catch (const std::exception& e) {
+                        spdlog::error("[worker] write_ad_hoc_result failed for job {}: {}", job.id, e.what());
+                        store.mark_error(job.id, e.what());
+                    }
+                    continue;
+                }
+
+                auto it = mapping_by_source.find(*job.source_table);
+                if (it == mapping_by_source.end() && !mapping_refreshed) {
+                    // A watch() call after this worker started won't be in the in-memory map yet.
+                    mapping_refreshed = true;
+                    spdlog::info("[worker] mapping cache miss for '{}', refreshing watched_tables from db", *job.source_table);
+                    try {
+                        mapping_by_source.clear();
+                        for (auto& t : store.load_watched_tables()) mapping_by_source.emplace(t.source, std::move(t));
+                        spdlog::info("[worker] watching {} table(s) after refresh: {}",
+                                     mapping_by_source.size(), join_sources(mapping_by_source));
+                        it = mapping_by_source.find(*job.source_table);
+                    } catch (const std::exception& e) {
+                        spdlog::error("[worker] failed to refresh watched_tables mapping: {}", e.what());
+                    }
+                }
                 if (it == mapping_by_source.end()) {
-                    store.mark_error(job.id, "no [[table]] mapping for '" + job.source_table +
-                                              "' in pgquarry.toml — was it removed since this job was enqueued?");
+                    store.mark_error(job.id, "no watch registered for '" + *job.source_table +
+                                              "' — was it removed since this job was enqueued?");
                     continue;
                 }
 
                 try {
-                    store.write_back(it->second, job.source_id, vectors[i]);
+                    store.write_back(it->second, *job.source_id, vectors[i]);
                     store.mark_done(job.id);
                     ++written;
+                    spdlog::debug("[worker] job {} written to {}.{}", job.id, it->second.target_table, it->second.target_column);
                 } catch (const std::exception& e) {
                     spdlog::error("[worker] write_back failed for job {}: {}", job.id, e.what());
                     store.mark_error(job.id, e.what());

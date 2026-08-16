@@ -1,6 +1,7 @@
 #pragma once
 
 #include <libpq-fe.h>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -9,12 +10,12 @@ namespace pgquarry {
 
 struct TableMapping;
 
-// Claim/lease access to pgquarry.jobs, plus v1's write-back into the user's
-// own table and the pgquarry.watched_tables config sync the generic trigger
-// depends on. Pattern-inspired by walkrie's BackfillStore (claim/mark_done
-// shape), but backed by Postgres itself rather than a local SQLite staging
-// file — there's no separate store to go stale-claim-reset on restart:
-// `processing` rows just sit there in v1 (no lease timeout yet).
+// Claim/lease access to pgquarry.jobs, plus write-back into the user's own
+// table via the pgquarry.watched_tables mapping pgquarry.watch() maintains.
+// Pattern-inspired by walkrie's BackfillStore (claim/mark_done shape), but
+// backed by Postgres itself rather than a local SQLite staging file — there's
+// no separate store to go stale-claim-reset on restart: `processing` rows
+// just sit there in v1.x (no lease timeout yet).
 class JobStore
 {
 public:
@@ -26,13 +27,15 @@ public:
 
     void connect(); // throws std::runtime_error on failure
 
+    // source_table/source_id/embed_column are unset for ad hoc jobs enqueued
+    // via pgquarry.embed_async() — those have no watched source row.
     struct ClaimedJob
     {
-        long long   id;
-        std::string source_table;
-        long long   source_id;
-        std::string embed_column;
-        std::string input_text;
+        long long                 id;
+        std::optional<std::string> source_table;
+        std::optional<long long>   source_id;
+        std::optional<std::string> embed_column;
+        std::string                input_text;
     };
 
     // Atomic claim: UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
@@ -47,10 +50,11 @@ public:
     void mark_done(long long id);
     void mark_error(long long id, const std::string& error);
 
-    // Upserts pgquarry.toml's [[table]] entries into pgquarry.watched_tables —
-    // called once at startup so the generic trigger can resolve a mapping by
-    // TG_TABLE_NAME without reading the TOML file itself.
-    void sync_watched_tables(const std::vector<TableMapping>& tables);
+    /// Ad hoc jobs (source_table IS NULL) write their result into the job row itself, not a user table.
+    void write_ad_hoc_result(long long id, const std::vector<float>& embedding);
+
+    /// Reads pgquarry.watched_tables, populated via pgquarry.watch() — the worker's write-back mapping source.
+    std::vector<TableMapping> load_watched_tables();
 
     void notify_jobs(int count);
 

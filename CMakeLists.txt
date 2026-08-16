@@ -17,10 +17,13 @@ if(PG_CONFIG)
                   OUTPUT_VARIABLE PG_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
   execute_process(COMMAND ${PG_CONFIG} --libdir
                   OUTPUT_VARIABLE PG_LIB_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+  execute_process(COMMAND ${PG_CONFIG} --sharedir
+                  OUTPUT_VARIABLE PG_SHARE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 else()
   message(WARNING "pg_config not found; falling back to system default paths (libpq-dev)")
   set(PG_INCLUDE_DIR "/usr/include")
   set(PG_LIB_DIR "/usr/lib64")
+  set(PG_SHARE_DIR "/usr/share/postgresql")
 endif()
 
 find_package(spdlog CONFIG REQUIRED)
@@ -64,3 +67,8 @@ target_link_libraries(pgquarry_worker PRIVATE
     ggml
     tomlplusplus
 )
+
+# `CREATE EXTENSION pgquarry;` needs these in Postgres's own extension dir —
+# separate from the worker binary, which the user places wherever they run it.
+install(FILES pgquarry.control sql/pgquarry--1.0.sql
+        DESTINATION ${PG_SHARE_DIR}/extension)
