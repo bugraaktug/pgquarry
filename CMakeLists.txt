@@ -25,6 +25,11 @@ endif()
 
 find_package(spdlog CONFIG REQUIRED)
 
+# toml++ v3.4.0 — single-header, MIT. Vendored at src/third_party/toml.hpp,
+# same convention walkrie uses for the same header.
+add_library(tomlplusplus INTERFACE)
+target_include_directories(tomlplusplus INTERFACE ${CMAKE_SOURCE_DIR}/src/third_party)
+
 # llama.cpp — built as part of this project via add_subdirectory.
 # EXCLUDE_FROM_ALL keeps llama.cpp's own example binaries from being built
 # unless explicitly requested. Set LLAMA_DIR on the cmake command line if
@@ -45,6 +50,7 @@ add_executable(pgquarry_worker
     src/embedding_provider.cpp
     src/llama_provider.cpp
     src/job_store.cpp
+    src/writeback_sql_builder.cpp
 )
 target_include_directories(pgquarry_worker PRIVATE
     ${PG_INCLUDE_DIR}
@@ -56,4 +62,5 @@ target_link_libraries(pgquarry_worker PRIVATE
     spdlog::spdlog_header_only
     llama
     ggml
+    tomlplusplus
 )

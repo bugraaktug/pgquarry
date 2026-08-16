@@ -2,16 +2,19 @@
 
 #include <libpq-fe.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-namespace pgquarry 
-{
+namespace pgquarry {
 
-// Claim/lease access to pgquarry.jobs. Pattern-inspired by walkrie's
-// BackfillStore (claim/mark_done shape), but backed by Postgres itself
-// rather than a local SQLite staging file — there's no separate store to
-// go stale-claim-reset on restart: `processing` rows just sit there in v0
-// (no lease timeout yet; see README's v1 roadmap for retention/cleanup).
+struct TableMapping;
+
+// Claim/lease access to pgquarry.jobs, plus v1's write-back into the user's
+// own table and the pgquarry.watched_tables config sync the generic trigger
+// depends on. Pattern-inspired by walkrie's BackfillStore (claim/mark_done
+// shape), but backed by Postgres itself rather than a local SQLite staging
+// file — there's no separate store to go stale-claim-reset on restart:
+// `processing` rows just sit there in v1 (no lease timeout yet).
 class JobStore
 {
 public:
@@ -26,6 +29,9 @@ public:
     struct ClaimedJob
     {
         long long   id;
+        std::string source_table;
+        long long   source_id;
+        std::string embed_column;
         std::string input_text;
     };
 
@@ -33,12 +39,30 @@ public:
     // RETURNING — one round trip, safe for multiple concurrent workers.
     std::vector<ClaimedJob> claim_pending(int limit);
 
-    void mark_done(long long id, const std::vector<float>& embedding);
+    // Writes the embedding into the mapping's target_table/target_column —
+    // UPDATE for same-table, UPSERT for a separate target_table. SQL text is
+    // cached per source_table so it's built once, not per row.
+    void write_back(const TableMapping& mapping, long long source_id, const std::vector<float>& embedding);
+
+    void mark_done(long long id);
     void mark_error(long long id, const std::string& error);
+
+    // Upserts pgquarry.toml's [[table]] entries into pgquarry.watched_tables —
+    // called once at startup so the generic trigger can resolve a mapping by
+    // TG_TABLE_NAME without reading the TOML file itself.
+    void sync_watched_tables(const std::vector<TableMapping>& tables);
+
+    void notify_jobs(int count);
+
+    // Deletes status='done' rows older than purge_after (a Postgres interval
+    // literal, e.g. "7 days"). Logs id/status/created_at per row first when
+    // verbose is true; returns the number of rows deleted.
+    int purge_done(const std::string& purge_after_interval, bool verbose);
 
 private:
     std::string conninfo_;
     PGconn* conn_ = nullptr;
+    std::unordered_map<std::string, std::string> write_back_sql_cache_; // source_table -> SQL
 };
 
 } // namespace pgquarry

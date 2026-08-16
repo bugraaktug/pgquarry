@@ -8,7 +8,7 @@ pgquarry — a Postgres-native async job queue for local LLM embedding inference
 
 ## Status
 
-Pre-v0. No code yet. First implementation task is the v0 spike described in README.md's Roadmap: prove the transplanted embedding path (mostly reused from walkrie, see README's reuse table) works standalone against a hand-populated `pgquarry.jobs` table, no extension/trigger/config system yet.
+v0 shipped: the transplanted embedding path (mostly reused from walkrie, see README's reuse table) works standalone against a hand-populated `pgquarry.jobs` table. Now building v1 per README.md's Roadmap: `pgquarry.toml`-driven worker, a generic trigger (`pgquarry.enqueue_job()`) that enqueues on INSERT/UPDATE, write-back into the user's own table (same-table `UPDATE` or cross-table `UPSERT` via the `[[table]]` array), `NOTIFY` instead of polling, and two-stage job retention.
 
 ## Conventions (carried over from walkrie)
 

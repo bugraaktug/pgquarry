@@ -59,4 +59,6 @@ Not carried over: `pgoutput_parser`, `wal_frame`, `replication_source`, `event_d
 
 ## Status
 
-Pre-v0. Planning only — no code yet.
+v0 proven (hand-populated job table, standalone worker). v1 in progress:
+config-driven worker, generic trigger, write-back into the user's own
+table, retention.

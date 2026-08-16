@@ -11,14 +11,44 @@ inline constexpr const char* kClaimPending =
     "  SELECT id FROM pgquarry.jobs WHERE status = 'pending' "
     "  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1"
     ") "
-    "RETURNING id, input_text";
+    "RETURNING id, source_table, source_id, embed_column, input_text";
 
+// v1: no embedding param — the vector goes to the user's table via
+// WritebackSqlBuilder, not into pgquarry.jobs. status='done' here just
+// marks the audit-trail row complete.
 inline constexpr const char* kMarkDone =
-    "UPDATE pgquarry.jobs SET status = 'done', embedding = $2, error = NULL, updated_at = now() "
+    "UPDATE pgquarry.jobs SET status = 'done', error = NULL, updated_at = now() "
     "WHERE id = $1";
 
 inline constexpr const char* kMarkError =
     "UPDATE pgquarry.jobs SET status = 'error', error = $2, updated_at = now() "
     "WHERE id = $1";
+
+// Config stays the single source of truth — the worker upserts its
+// pgquarry.toml [[table]] entries here on every startup so the zero-arg
+// enqueue_job() trigger can look up id_column/embed_column/target_* by
+// TG_TABLE_NAME alone.
+inline constexpr const char* kUpsertWatchedTable =
+    "INSERT INTO pgquarry.watched_tables "
+    "  (source_table, id_column, embed_column, target_table, target_column, target_id_column) "
+    "VALUES ($1, $2, $3, $4, $5, $6) "
+    "ON CONFLICT (source_table) DO UPDATE SET "
+    "  id_column = EXCLUDED.id_column, "
+    "  embed_column = EXCLUDED.embed_column, "
+    "  target_table = EXCLUDED.target_table, "
+    "  target_column = EXCLUDED.target_column, "
+    "  target_id_column = EXCLUDED.target_id_column";
+
+inline constexpr const char* kNotify =
+    "SELECT pg_notify('pgquarry_jobs', $1)";
+
+// purge_verbose logging needs id/status/created_at for every row about to
+// be deleted, so the worker SELECTs before it DELETEs when that's on.
+inline constexpr const char* kSelectPurgeCandidates =
+    "SELECT id, status, created_at FROM pgquarry.jobs "
+    "WHERE status = 'done' AND updated_at < now() - $1::interval";
+
+inline constexpr const char* kPurgeDone =
+    "DELETE FROM pgquarry.jobs WHERE status = 'done' AND updated_at < now() - $1::interval";
 
 } // namespace pgquarry::sql
