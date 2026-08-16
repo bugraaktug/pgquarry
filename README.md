@@ -4,9 +4,7 @@
 
 pgquarry turns any Postgres table into a self-embedding table: watch a column, and every `INSERT`/`UPDATE` gets its vector filled in automatically — no application code, no CDC pipeline, no external ML service to run alongside Postgres.
 
-## Why pgquarry, not walkrie
-
-Reach for [walkrie](https://github.com/bugraaktug/walkrie) when you need embeddings kept in sync with an existing table's live change stream via logical replication (WAL) — no trigger, no touching the source schema. Reach for pgquarry when a trigger is fine and you want a plain job-queue mechanism you can also drive directly from SQL or application code (`embed_async()`/`embed_sync()`), not only from row changes.
+If you need your embeddings kept in sync with an existing table's live change stream via logical replication (WAL) — no trigger, no touching the source schema — reach for [walkrie](https://github.com/bugraaktug/walkrie) instead. pgquarry is for when a trigger is fine and you want a plain job-queue mechanism you can also drive directly from SQL or application code (`embed_async()`/`embed_sync()`), not only from row changes.
 
 ## How it works
 
@@ -71,12 +69,34 @@ The worker (`pgquarry_worker`) is a separate OS process, not an in-postmaster ba
    -- SELECT embedding FROM docs WHERE id = 1;  -- filled in by the worker
    ```
 
+   Or register a cross-table watch — the worker `UPSERT`s into a separate table instead of augmenting the source row (e.g. a chunk/embedding-table split):
+
+   ```sql
+   CREATE TABLE docs_chunks (id bigserial PRIMARY KEY, chunk_text text NOT NULL);
+   CREATE TABLE chunk_embeddings (chunk_id bigint PRIMARY KEY, embedding vector(1024));
+   SELECT pgquarry.watch('docs_chunks', 'chunk_text', 'id', 'chunk_embeddings', 'embedding', 'chunk_id');
+   INSERT INTO docs_chunks (chunk_text) VALUES ('this chunk gets a row in chunk_embeddings');
+   ```
+
    Or skip the table and trigger entirely for ad hoc text:
 
    ```sql
+   -- Fire-and-forget: enqueue and move on, check back later via jobs.id
+   SELECT pgquarry.embed_async('embed this later');
+
+   -- Or block until it's done (or times out)
    CALL pgquarry.embed_sync('embed this on demand', 5000);
    ```
 
+## Known limitations
+
+- **Deleting a watched source row doesn't cancel or clean up its jobs.** The trigger only fires on `INSERT`/`UPDATE`; a `DELETE` leaves any in-flight `pgquarry.jobs` row for that id in place. For same-table write-back the eventual `UPDATE` just affects zero rows. For cross-table write-back (`target_table` != source) the eventual `UPSERT` will *insert* a new row into `target_table` keyed to an id whose source row no longer exists — an orphan embedding row you're responsible for cleaning up if that matters to your schema.
+
+## Roadmap
+
+- **v1.x** (current): `CREATE EXTENSION` provisioning, `pgquarry.watch()` / `embed_async()` / `embed_sync()` SQL API.
+- **v2**: OpenAI-compatible embeddings API support as an alternative backend to local GGUF/`llama.cpp` inference.
+
 ## License
 
-Apache-2.0. Portions of the embedding-provider code are adapted from [walkrie](https://github.com/bugraaktug/walkrie) (also Apache-2.0).
+Apache-2.0. Portions of the embedding-provider code are adapted from [walkrie](https://github.com/bugraaktug/walkrie) (also Apache-2.0). Developed with AI assistance via [Claude Code](https://claude.com/claude-code).
