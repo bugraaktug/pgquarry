@@ -72,3 +72,17 @@ target_link_libraries(pgquarry_worker PRIVATE
 # separate from the worker binary, which the user places wherever they run it.
 install(FILES pgquarry.control sql/pgquarry--1.0.sql
         DESTINATION ${PG_SHARE_DIR}/extension)
+
+# doctest v2.4.11 — single-header, MIT. Vendored at src/third_party/doctest.h,
+# same convention as toml++ above. Only covers pure logic (AppConfig::validate())
+# so it doesn't link libpq/llama.cpp at all.
+enable_testing()
+add_executable(pgquarry_tests tests/config_test.cpp)
+target_include_directories(pgquarry_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/third_party
+)
+target_compile_definitions(pgquarry_tests PRIVATE
+    TESTS_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
+)
+add_test(NAME pgquarry_tests COMMAND pgquarry_tests)
