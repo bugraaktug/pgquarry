@@ -52,8 +52,12 @@ add_executable(pgquarry_worker
     src/worker_main.cpp
     src/embedding_provider.cpp
     src/llama_provider.cpp
+    src/generation_provider.cpp
+    src/llama_generation_provider.cpp
     src/job_store.cpp
+    src/job_dispatcher.cpp
     src/writeback_sql_builder.cpp
+    src/watch_cache.cpp
 )
 target_include_directories(pgquarry_worker PRIVATE
     ${PG_INCLUDE_DIR}

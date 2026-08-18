@@ -141,6 +141,94 @@ TEST_CASE("validate: embedding dimensions/threads/ctx/batch/gpu-layers")
     }
 }
 
+TEST_CASE("validate: [worker] generation_model_path")
+{
+    SUBCASE("empty is fine — generation is optional, unlike embedding.model_path")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path.clear();
+        CHECK(cfg.validate().empty());
+    }
+
+    SUBCASE("nonexistent path is rejected")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path = fixture("does_not_exist.gguf");
+        CHECK(has_error(cfg.validate(), "generation_model_path does not exist"));
+    }
+
+    SUBCASE("a directory is rejected as not a regular file")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path = TESTS_FIXTURES_DIR;
+        CHECK(has_error(cfg.validate(), "generation_model_path exists but is not a regular file"));
+    }
+
+    SUBCASE("a 0-byte file is rejected")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path = fixture("empty_model.gguf");
+        CHECK(has_error(cfg.validate(), "generation_model_path points to an empty (0-byte) file"));
+    }
+
+    SUBCASE("an unreadable file is rejected")
+    {
+        if (geteuid() == 0) {
+            return;
+        }
+
+        namespace fs = std::filesystem;
+        fs::path path = fs::temp_directory_path() / "pgquarry_test_unreadable_gen.gguf";
+        {
+            std::ofstream f(path);
+            f << "some bytes";
+        }
+        chmod(path.c_str(), 0000);
+
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path = path.string();
+        CHECK(has_error(cfg.validate(), "generation_model_path exists but is not readable by the current user"));
+
+        chmod(path.c_str(), 0644);
+        fs::remove(path);
+    }
+
+    SUBCASE("a readable, non-empty path is fine")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.model_path = fixture("readable_model.gguf");
+        CHECK(cfg.validate().empty());
+    }
+}
+
+TEST_CASE("validate: generation max_tokens/ctx/threads/gpu-layers")
+{
+    SUBCASE("generation_max_tokens must be > 0")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.max_tokens = 0;
+        CHECK(has_error(cfg.validate(), "[worker] generation_max_tokens must be > 0"));
+    }
+    SUBCASE("generation_n_ctx must be > 0")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.n_ctx = 0;
+        CHECK(has_error(cfg.validate(), "[worker] generation_n_ctx must be > 0"));
+    }
+    SUBCASE("generation_n_threads must be > 0")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.n_threads = 0;
+        CHECK(has_error(cfg.validate(), "[worker] generation_n_threads must be > 0"));
+    }
+    SUBCASE("generation_n_gpu_layers must be >= 0")
+    {
+        AppConfig cfg = valid_config();
+        cfg.generation.n_gpu_layers = -1;
+        CHECK(has_error(cfg.validate(), "[worker] generation_n_gpu_layers must be >= 0"));
+    }
+}
+
 TEST_CASE("validate: [worker] poll_interval_ms must be > 0")
 {
     AppConfig cfg = valid_config();

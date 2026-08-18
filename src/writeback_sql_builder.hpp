@@ -19,6 +19,11 @@ public:
 
     // Cross-table case: INSERT ... ON CONFLICT (target_id_column) DO UPDATE
     static std::string build_upsert_sql(const TableMapping& m);
+
+    // Text-typed counterparts for job_type='generate' mappings — identical
+    // shape, just $1 (plain text) instead of $1::vector.
+    static std::string build_update_sql_text(const TableMapping& m);
+    static std::string build_upsert_sql_text(const TableMapping& m);
 };
 
 } // namespace pgquarry

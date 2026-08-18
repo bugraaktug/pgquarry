@@ -11,7 +11,7 @@ inline constexpr const char* kClaimPending =
     "  SELECT id FROM pgquarry.jobs WHERE status = 'pending' "
     "  ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1"
     ") "
-    "RETURNING id, source_table, source_id, embed_column, input_text";
+    "RETURNING id, source_table, source_id, source_column, input_text, job_type, max_tokens";
 
 // v1: no embedding param — the vector goes to the user's table via
 // WritebackSqlBuilder, not into pgquarry.jobs. status='done' here just
@@ -31,7 +31,7 @@ inline constexpr const char* kNotify =
 // built from this, not from pgquarry.toml alone, so a table registered via
 // pgquarry.watch() (SQL-side, no toml entry) works without a worker restart.
 inline constexpr const char* kSelectWatchedTables =
-    "SELECT source_table, id_column, embed_column, target_table, target_column, target_id_column "
+    "SELECT source_table, job_type, id_column, source_column, target_table, target_column, target_id_column "
     "FROM pgquarry.watched_tables";
 
 // Ad hoc jobs (source_table IS NULL, enqueued via pgquarry.embed_async())
@@ -39,6 +39,12 @@ inline constexpr const char* kSelectWatchedTables =
 // itself for pgquarry.embed_sync() to read back out.
 inline constexpr const char* kWriteAdHocResult =
     "UPDATE pgquarry.jobs SET status = 'done', error = NULL, result = $2::vector, updated_at = now() "
+    "WHERE id = $1";
+
+// Text-typed counterpart for ad hoc 'generate' jobs (pgquarry.generate_async()) —
+// same shape, result_text instead of result, no ::vector cast.
+inline constexpr const char* kWriteAdHocResultText =
+    "UPDATE pgquarry.jobs SET status = 'done', error = NULL, result_text = $2, updated_at = now() "
     "WHERE id = $1";
 
 // purge_verbose logging needs id/status/created_at for every row about to

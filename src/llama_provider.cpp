@@ -20,7 +20,9 @@ LlamaProvider::LlamaProvider(const EmbeddingConfig& cfg)
 LlamaProvider::~LlamaProvider() {
     if (ctx_)   llama_free(ctx_);
     if (model_) llama_model_free(model_);
-    llama_backend_free();
+    // llama_backend_free() intentionally NOT called here — see worker_main.cpp's
+    // LlamaBackendGuard (backend init/free must be process-wide, not per-provider,
+    // now that a second llama.cpp-backed provider can exist in the same process).
 }
 
 void LlamaProvider::init()
@@ -36,7 +38,8 @@ void LlamaProvider::init()
         }
     }, nullptr);
 
-    llama_backend_init();
+    // llama_backend_init() intentionally NOT called here — see worker_main.cpp's
+    // LlamaBackendGuard.
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers_;

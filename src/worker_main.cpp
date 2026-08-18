@@ -6,18 +6,31 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
+#include <llama.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include "config.hpp"
 #include "embedding_provider.hpp"
+#include "generation_provider.hpp"
+#include "job_dispatcher.hpp"
 #include "job_store.hpp"
+#include "job_type.hpp"
+#include "watch_cache.hpp"
 
 namespace
 {
+
+// llama.cpp documents backend init/free as call-once-per-process. Both
+// LlamaProvider and LlamaGenerationProvider are llama.cpp-backed but no
+// longer call these themselves — this is the single process-wide owner,
+// scoped to outlive both providers (declared before either in main()).
+struct LlamaBackendGuard {
+    LlamaBackendGuard()  { llama_backend_init(); }
+    ~LlamaBackendGuard() { llama_backend_free(); }
+};
 
 // Config isn't loaded yet when this runs (log_file/log_level are themselves
 // config), so failures here only ever reach stderr.
@@ -55,16 +68,6 @@ void handle_signal(int) { g_shutdown = 1; }
 // of poll_interval_ms, rather than every single idle tick — retention has
 // no dedicated interval in pgquarry.toml, so this is a fixed default.
 constexpr auto kPurgeCheckInterval = std::chrono::seconds(60);
-
-std::string join_sources(const std::unordered_map<std::string, pgquarry::TableMapping>& mapping)
-{
-    std::string joined;
-    for (const auto& [source, _] : mapping) {
-        if (!joined.empty()) joined += ", ";
-        joined += source;
-    }
-    return joined.empty() ? "(none)" : joined;
-}
 
 } // namespace
 
@@ -112,6 +115,10 @@ int main(int argc, char** argv)
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
+    // Declared before any provider — C++ destroys locals in reverse
+    // declaration order, so this outlives every provider constructed below.
+    LlamaBackendGuard llama_backend_guard;
+
     std::shared_ptr<pgquarry::EmbeddingProvider> provider;
     try {
         provider = pgquarry::make_embedding_provider(cfg.embedding);
@@ -129,14 +136,31 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // Generation is optional — no generation_model_path means the worker still
+    // starts, but any claimed 'generate' job fails per-job (dispatch_generate_jobs)
+    // instead of blocking startup the way a missing embedding model_path does above.
+    std::shared_ptr<pgquarry::GenerationProvider> gen_provider;
+    if (!cfg.generation.model_path.empty()) {
+        try {
+            gen_provider = pgquarry::make_generation_provider(cfg.generation);
+            gen_provider->init();
+            spdlog::info("[worker] generation provider initialized: {}", gen_provider->name());
+        } catch (const std::exception& e) {
+            spdlog::error("[worker] failed to initialize generation provider: {}", e.what());
+            return 1;
+        }
+    } else {
+        spdlog::info("[worker] no [worker] generation_model_path configured — 'generate' jobs will be marked error");
+    }
+
     pgquarry::JobStore store(cfg.conninfo);
-    std::unordered_map<std::string, pgquarry::TableMapping> mapping_by_source;
+    pgquarry::WatchCache mappings(store);
     try {
         store.connect();
         spdlog::debug("[worker] connected to database");
-        /// watched_tables (populated via pgquarry.watch()) is the worker's write-back mapping source.
-        for (auto& t : store.load_watched_tables()) mapping_by_source.emplace(t.source, std::move(t));
-        spdlog::info("[worker] watching {} table(s): {}", mapping_by_source.size(), join_sources(mapping_by_source));
+        /// watched_tables (populated via pgquarry.watch()/.watch_generate()) is the worker's write-back mapping source.
+        mappings.load();
+        spdlog::info("[worker] watching {} mapping(s): {}", mappings.size(), mappings.describe());
     } catch (const std::exception& e) {
         spdlog::error("[worker] {}", e.what());
         return 1;
@@ -145,9 +169,9 @@ int main(int argc, char** argv)
     std::optional<std::string> purge_interval = pgquarry::parse_purge_after(cfg.retention.purge_after);
     auto last_purge_check = std::chrono::steady_clock::now();
 
-    spdlog::info("[worker] ready — provider={}, dimensions={}, batch_size={}, poll_interval_ms={}, tables={}",
-                 provider->name(), provider->dimensions(), cfg.embedding.max_batch_size,
-                 cfg.poll_interval_ms, mapping_by_source.size());
+    spdlog::info("[worker] ready — provider={}, dimensions={}, generation_provider={}, batch_size={}, poll_interval_ms={}, mappings={}",
+                 provider->name(), provider->dimensions(), gen_provider ? gen_provider->name() : "(none)",
+                 cfg.embedding.max_batch_size, cfg.poll_interval_ms, mappings.size());
 
     while (!g_shutdown) {
         std::vector<pgquarry::JobStore::ClaimedJob> claimed;
@@ -171,79 +195,14 @@ int main(int argc, char** argv)
                 return ids;
             }());
 
-            std::vector<std::string> texts;
-            texts.reserve(claimed.size());
-            for (const auto& job : claimed) texts.push_back(job.input_text);
-
-            std::vector<std::vector<float>> vectors;
-            try {
-                vectors = provider->embed_batch(texts);
-            } catch (const std::exception& e) {
-                spdlog::error("[worker] embed_batch failed for a batch of {}: {}", claimed.size(), e.what());
-                for (const auto& job : claimed) store.mark_error(job.id, e.what());
-                vectors.clear();
+            std::vector<pgquarry::JobStore::ClaimedJob> embed_jobs, generate_jobs;
+            for (auto& job : claimed) {
+                (job.job_type == pgquarry::JobType::Generate ? generate_jobs : embed_jobs).push_back(job);
             }
 
-            if (!vectors.empty() && vectors.size() != claimed.size()) {
-                spdlog::error("[worker] embed_batch returned {} vectors for {} jobs — marking batch as error",
-                              vectors.size(), claimed.size());
-                for (const auto& job : claimed) store.mark_error(job.id, "embed_batch size mismatch");
-                vectors.clear();
-            }
-
-            int written = 0;
-            bool mapping_refreshed = false; // reload watched_tables at most once per batch on a cache miss
-            for (size_t i = 0; i < vectors.size(); ++i) {
-                const auto& job = claimed[i];
-                if (vectors[i].empty()) {
-                    store.mark_error(job.id, "no embedding produced (see worker log for tokenization details)");
-                    continue;
-                }
-
-                if (!job.source_table.has_value()) {
-                    // Ad hoc job (pgquarry.embed_async()) — no source table, result goes into the job row itself.
-                    try {
-                        store.write_ad_hoc_result(job.id, vectors[i]);
-                        ++written;
-                        spdlog::debug("[worker] job {} (ad hoc) written to jobs.result", job.id);
-                    } catch (const std::exception& e) {
-                        spdlog::error("[worker] write_ad_hoc_result failed for job {}: {}", job.id, e.what());
-                        store.mark_error(job.id, e.what());
-                    }
-                    continue;
-                }
-
-                auto it = mapping_by_source.find(*job.source_table);
-                if (it == mapping_by_source.end() && !mapping_refreshed) {
-                    // A watch() call after this worker started won't be in the in-memory map yet.
-                    mapping_refreshed = true;
-                    spdlog::info("[worker] mapping cache miss for '{}', refreshing watched_tables from db", *job.source_table);
-                    try {
-                        mapping_by_source.clear();
-                        for (auto& t : store.load_watched_tables()) mapping_by_source.emplace(t.source, std::move(t));
-                        spdlog::info("[worker] watching {} table(s) after refresh: {}",
-                                     mapping_by_source.size(), join_sources(mapping_by_source));
-                        it = mapping_by_source.find(*job.source_table);
-                    } catch (const std::exception& e) {
-                        spdlog::error("[worker] failed to refresh watched_tables mapping: {}", e.what());
-                    }
-                }
-                if (it == mapping_by_source.end()) {
-                    store.mark_error(job.id, "no watch registered for '" + *job.source_table +
-                                              "' — was it removed since this job was enqueued?");
-                    continue;
-                }
-
-                try {
-                    store.write_back(it->second, *job.source_id, vectors[i]);
-                    store.mark_done(job.id);
-                    ++written;
-                    spdlog::debug("[worker] job {} written to {}.{}", job.id, it->second.target_table, it->second.target_column);
-                } catch (const std::exception& e) {
-                    spdlog::error("[worker] write_back failed for job {}: {}", job.id, e.what());
-                    store.mark_error(job.id, e.what());
-                }
-            }
+            mappings.begin_batch();
+            int written = pgquarry::dispatch_embed_jobs(store, *provider, mappings, embed_jobs)
+                        + pgquarry::dispatch_generate_jobs(store, gen_provider.get(), cfg.generation.max_tokens, mappings, generate_jobs);
 
             if (written > 0) {
                 store.notify_jobs(written);

@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "job_type.hpp"
+
 namespace pgquarry {
 
 struct TableMapping;
@@ -27,15 +29,18 @@ public:
 
     void connect(); // throws std::runtime_error on failure
 
-    // source_table/source_id/embed_column are unset for ad hoc jobs enqueued
-    // via pgquarry.embed_async() — those have no watched source row.
+    // source_table/source_id/source_column are unset for ad hoc jobs enqueued
+    // via pgquarry.embed_async()/.generate_async() — those have no watched
+    // source row. max_tokens is only ever set for job_type=Generate.
     struct ClaimedJob
     {
-        long long                 id;
+        long long                  id;
         std::optional<std::string> source_table;
         std::optional<long long>   source_id;
-        std::optional<std::string> embed_column;
+        std::optional<std::string> source_column;
         std::string                input_text;
+        JobType                    job_type = JobType::Embed;
+        std::optional<int>         max_tokens;
     };
 
     // Atomic claim: UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
@@ -44,14 +49,18 @@ public:
 
     // Writes the embedding into the mapping's target_table/target_column —
     // UPDATE for same-table, UPSERT for a separate target_table. SQL text is
-    // cached per source_table so it's built once, not per row.
+    // cached per (source_table, job_type) so it's built once, not per row.
     void write_back(const TableMapping& mapping, long long source_id, const std::vector<float>& embedding);
+
+    // Text-typed counterpart, for job_type='generate' mappings.
+    void write_back_text(const TableMapping& mapping, long long source_id, const std::string& text);
 
     void mark_done(long long id);
     void mark_error(long long id, const std::string& error);
 
     /// Ad hoc jobs (source_table IS NULL) write their result into the job row itself, not a user table.
     void write_ad_hoc_result(long long id, const std::vector<float>& embedding);
+    void write_ad_hoc_result_text(long long id, const std::string& text);
 
     /// Reads pgquarry.watched_tables, populated via pgquarry.watch() — the worker's write-back mapping source.
     std::vector<TableMapping> load_watched_tables();
@@ -66,7 +75,7 @@ public:
 private:
     std::string conninfo_;
     PGconn* conn_ = nullptr;
-    std::unordered_map<std::string, std::string> write_back_sql_cache_; // source_table -> SQL
+    std::unordered_map<std::string, std::string> write_back_sql_cache_; // "source_table\x1fjob_type" -> SQL
 };
 
 } // namespace pgquarry

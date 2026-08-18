@@ -12,15 +12,18 @@
 #include <toml.hpp>
 
 #include "embedding_config.hpp"
+#include "generation_config.hpp"
 
 namespace pgquarry {
 
-/// One pgquarry.watched_tables row, registered via pgquarry.watch(): watches source.embed_column for
-/// INSERT/UPDATE, writes the resulting vector into target_table.target_column keyed by target_id_column.
+/// One pgquarry.watched_tables row, registered via pgquarry.watch()/watch_generate(): watches
+/// source.source_column for INSERT/UPDATE, writes the result (vector for job_type='embed', text for
+/// 'generate') into target_table.target_column keyed by target_id_column.
 struct TableMapping
 {
     std::string source;
-    std::string embed_column;
+    std::string job_type;
+    std::string source_column;
     std::string id_column;
     std::string target_table;
     std::string target_column;
@@ -76,6 +79,7 @@ struct AppConfig
 {
     std::string       conninfo;
     EmbeddingConfig    embedding;
+    GenerationConfig   generation;
     int                poll_interval_ms = 1000;
     RetentionConfig    retention;
     LoggingConfig      logging;
@@ -108,6 +112,25 @@ struct AppConfig
         if (embedding.dimensions <= 0)     errors.push_back("[worker] dimensions must be > 0");
         if (embedding.n_threads <= 0)      errors.push_back("[worker] n_threads must be > 0");
         if (embedding.n_ctx <= 0)          errors.push_back("[worker] n_ctx must be > 0");
+        // generation_model_path is OPTIONAL (unlike model_path above) — only validated if set.
+        if (!generation.model_path.empty()) {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const std::string& path = generation.model_path;
+            if (!fs::exists(path, ec)) {
+                errors.push_back("[worker] generation_model_path does not exist: '" + path + "'");
+            } else if (!fs::is_regular_file(path, ec)) {
+                errors.push_back("[worker] generation_model_path exists but is not a regular file: '" + path + "'");
+            } else if (access(path.c_str(), R_OK) != 0) {
+                errors.push_back("[worker] generation_model_path exists but is not readable by the current user: '" + path + "'");
+            } else if (fs::file_size(path, ec) == 0) {
+                errors.push_back("[worker] generation_model_path points to an empty (0-byte) file: '" + path + "'");
+            }
+        }
+        if (generation.max_tokens <= 0)    errors.push_back("[worker] generation_max_tokens must be > 0");
+        if (generation.n_ctx <= 0)         errors.push_back("[worker] generation_n_ctx must be > 0");
+        if (generation.n_threads <= 0)     errors.push_back("[worker] generation_n_threads must be > 0");
+        if (generation.n_gpu_layers < 0)   errors.push_back("[worker] generation_n_gpu_layers must be >= 0");
         if (embedding.max_batch_size <= 0) errors.push_back("[worker] batch_size must be > 0");
         if (embedding.n_gpu_layers < 0)    errors.push_back("[worker] n_gpu_layers must be >= 0");
         if (poll_interval_ms <= 0)         errors.push_back("[worker] poll_interval_ms must be > 0");
@@ -166,6 +189,12 @@ inline AppConfig load_config(const std::string& path)
         cfg.embedding.max_batch_size = i32(w, "batch_size",      cfg.embedding.max_batch_size);
         cfg.embedding.n_gpu_layers   = i32(w, "n_gpu_layers",    cfg.embedding.n_gpu_layers);
         cfg.poll_interval_ms         = i32(w, "poll_interval_ms", cfg.poll_interval_ms);
+
+        cfg.generation.model_path    = str(w, "generation_model_path",    cfg.generation.model_path);
+        cfg.generation.max_tokens    = i32(w, "generation_max_tokens",    cfg.generation.max_tokens);
+        cfg.generation.n_ctx         = i32(w, "generation_n_ctx",         cfg.generation.n_ctx);
+        cfg.generation.n_threads     = i32(w, "generation_n_threads",     cfg.generation.n_threads);
+        cfg.generation.n_gpu_layers  = i32(w, "generation_n_gpu_layers",  cfg.generation.n_gpu_layers);
     }
 
     if (auto* r = tbl["retention"].as_table()) {

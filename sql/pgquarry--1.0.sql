@@ -1,9 +1,9 @@
 -- pgquarry v1.x — installed via `CREATE EXTENSION pgquarry;` (add `CASCADE`
 -- if the `vector` extension isn't already present). Supersedes the v1
 -- hand-run flow in v0_schema.sql/v1_schema.sql: schema/trigger provisioning
--- now goes through pgquarry.watch() instead of a manual CREATE TRIGGER, and
--- pgquarry.embed_async()/.embed_sync() enqueue ad hoc text with no source
--- table or trigger at all.
+-- now goes through pgquarry.watch()/.watch_generate() instead of a manual
+-- CREATE TRIGGER, and pgquarry.embed_async()/.embed_sync()/.generate_async()/
+-- .generate_sync() enqueue ad hoc text with no source table or trigger at all.
 
 CREATE SCHEMA IF NOT EXISTS pgquarry;
 
@@ -15,11 +15,15 @@ CREATE TABLE pgquarry.jobs (
     id            bigserial PRIMARY KEY,
     status        text NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending', 'processing', 'done', 'error')),
+    job_type      text NOT NULL DEFAULT 'embed'
+                  CHECK (job_type IN ('embed', 'generate')),
     source_table  text,
     source_id     bigint,
-    embed_column  text,
+    source_column text,
     input_text    text NOT NULL,
+    max_tokens    int,
     result        vector,
+    result_text   text,
     error         text,
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now()
@@ -30,32 +34,44 @@ CREATE TABLE pgquarry.jobs (
 -- works without the other — the worker reads this table directly to build
 -- its write-back mapping, rather than only trusting its own toml config.
 CREATE TABLE pgquarry.watched_tables (
-    source_table      text PRIMARY KEY,
+    source_table      text NOT NULL,
+    job_type          text NOT NULL DEFAULT 'embed' CHECK (job_type IN ('embed', 'generate')),
     id_column         text NOT NULL,
-    embed_column      text NOT NULL,
+    source_column     text NOT NULL,
     target_table      text NOT NULL,
     target_column     text NOT NULL,
-    target_id_column  text NOT NULL
+    target_id_column  text NOT NULL,
+    PRIMARY KEY (source_table, job_type)
 );
 
+-- job_type(s) come in as trigger arguments (TG_ARGV, set by watch()/
+-- watch_generate() when they CREATE TRIGGER) — one job is enqueued per arg,
+-- so a single trigger firing (e.g. watch_generate()'s combined embed+generate
+-- registration) can enqueue more than one job from the same row change.
 CREATE OR REPLACE FUNCTION pgquarry.enqueue_job() RETURNS trigger AS $$
 DECLARE
     w pgquarry.watched_tables%ROWTYPE;
-    row_id   text;
-    row_text text;
+    v_job_type text;
+    row_id     text;
+    row_text   text;
 BEGIN
-    SELECT * INTO w FROM pgquarry.watched_tables WHERE source_table = TG_TABLE_NAME;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'pgquarry.enqueue_job: no watch registered for "%" — '
-            'call pgquarry.watch(''%'', ...) or add it to pgquarry.toml and '
-            '(re)start pgquarry_worker', TG_TABLE_NAME, TG_TABLE_NAME;
-    END IF;
+    FOR i IN 0 .. TG_NARGS - 1 LOOP
+        v_job_type := TG_ARGV[i];
 
-    row_id   := to_jsonb(NEW) ->> w.id_column;
-    row_text := to_jsonb(NEW) ->> w.embed_column;
+        SELECT * INTO w FROM pgquarry.watched_tables
+            WHERE source_table = TG_TABLE_NAME AND job_type = v_job_type;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'pgquarry.enqueue_job: no % watch registered for "%" — '
+                'call pgquarry.watch(...) / pgquarry.watch_generate(...) as appropriate, or add it to '
+                'pgquarry.toml and (re)start pgquarry_worker', v_job_type, TG_TABLE_NAME;
+        END IF;
 
-    INSERT INTO pgquarry.jobs (source_table, source_id, embed_column, input_text)
-    VALUES (TG_TABLE_NAME, row_id::bigint, w.embed_column, row_text);
+        row_id   := to_jsonb(NEW) ->> w.id_column;
+        row_text := to_jsonb(NEW) ->> w.source_column;
+
+        INSERT INTO pgquarry.jobs (source_table, source_id, source_column, input_text, job_type)
+        VALUES (TG_TABLE_NAME, row_id::bigint, w.source_column, row_text, v_job_type);
+    END LOOP;
 
     RETURN NEW;
 END;
@@ -88,19 +104,81 @@ BEGIN
     END IF;
 
     INSERT INTO pgquarry.watched_tables
-        (source_table, id_column, embed_column, target_table, target_column, target_id_column)
-    VALUES (p_source, p_id_column, p_embed_column, resolved_target_table, p_target_column, resolved_target_id_column)
-    ON CONFLICT (source_table) DO UPDATE SET
+        (source_table, job_type, id_column, source_column, target_table, target_column, target_id_column)
+    VALUES (p_source, 'embed', p_id_column, p_embed_column, resolved_target_table, p_target_column, resolved_target_id_column)
+    ON CONFLICT (source_table, job_type) DO UPDATE SET
         id_column        = EXCLUDED.id_column,
-        embed_column      = EXCLUDED.embed_column,
+        source_column     = EXCLUDED.source_column,
         target_table      = EXCLUDED.target_table,
         target_column     = EXCLUDED.target_column,
         target_id_column  = EXCLUDED.target_id_column;
 
     EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', trigger_name, p_source);
     EXECUTE format(
-        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OF %I ON %I FOR EACH ROW EXECUTE FUNCTION pgquarry.enqueue_job()',
-        trigger_name, p_embed_column, p_source
+        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OF %I ON %I FOR EACH ROW EXECUTE FUNCTION pgquarry.enqueue_job(%L)',
+        trigger_name, p_embed_column, p_source, 'embed'
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Combined embed+generate registration: upserts BOTH a job_type='embed' and a
+-- job_type='generate' mapping and installs ONE trigger (TG_ARGV=('embed',
+-- 'generate')) that fires enqueue_job() for both on the same INSERT/UPDATE —
+-- see enqueue_job()'s header comment. Also drops any plain watch()-created
+-- '_pgquarry_embed' trigger on this source: leaving it in place alongside
+-- this combined one would double-enqueue embed jobs on every row change.
+-- Call plain watch() again afterward if you want to go back to embed-only.
+CREATE OR REPLACE FUNCTION pgquarry.watch_generate(
+    p_source                    text,
+    p_embed_column               text,
+    p_embed_target_column        text,
+    p_prompt_column              text,
+    p_generate_target_column     text,
+    p_id_column                  text DEFAULT 'id',
+    p_embed_target_table         text DEFAULT NULL,
+    p_embed_target_id_column     text DEFAULT NULL,
+    p_generate_target_table      text DEFAULT NULL,
+    p_generate_target_id_column  text DEFAULT NULL
+) RETURNS void AS $$
+DECLARE
+    resolved_embed_target_table        text := COALESCE(p_embed_target_table, p_source);
+    resolved_embed_target_id_column    text := COALESCE(p_embed_target_id_column, p_id_column);
+    resolved_generate_target_table     text := COALESCE(p_generate_target_table, p_source);
+    resolved_generate_target_id_column text := COALESCE(p_generate_target_id_column, p_id_column);
+    trigger_name text := p_source || '_pgquarry_generate';
+BEGIN
+    IF p_embed_target_column IS NULL THEN
+        RAISE EXCEPTION 'pgquarry.watch_generate: embed_target_column is required (which column should the embedding land in?)';
+    END IF;
+    IF p_generate_target_column IS NULL THEN
+        RAISE EXCEPTION 'pgquarry.watch_generate: generate_target_column is required (which column should the generated text land in?)';
+    END IF;
+
+    INSERT INTO pgquarry.watched_tables
+        (source_table, job_type, id_column, source_column, target_table, target_column, target_id_column)
+    VALUES (p_source, 'embed', p_id_column, p_embed_column, resolved_embed_target_table, p_embed_target_column, resolved_embed_target_id_column)
+    ON CONFLICT (source_table, job_type) DO UPDATE SET
+        id_column        = EXCLUDED.id_column,
+        source_column     = EXCLUDED.source_column,
+        target_table      = EXCLUDED.target_table,
+        target_column      = EXCLUDED.target_column,
+        target_id_column  = EXCLUDED.target_id_column;
+
+    INSERT INTO pgquarry.watched_tables
+        (source_table, job_type, id_column, source_column, target_table, target_column, target_id_column)
+    VALUES (p_source, 'generate', p_id_column, p_prompt_column, resolved_generate_target_table, p_generate_target_column, resolved_generate_target_id_column)
+    ON CONFLICT (source_table, job_type) DO UPDATE SET
+        id_column        = EXCLUDED.id_column,
+        source_column     = EXCLUDED.source_column,
+        target_table      = EXCLUDED.target_table,
+        target_column      = EXCLUDED.target_column,
+        target_id_column  = EXCLUDED.target_id_column;
+
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', p_source || '_pgquarry_embed', p_source);
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON %I', trigger_name, p_source);
+    EXECUTE format(
+        'CREATE TRIGGER %I AFTER INSERT OR UPDATE OF %I, %I ON %I FOR EACH ROW EXECUTE FUNCTION pgquarry.enqueue_job(%L, %L)',
+        trigger_name, p_embed_column, p_prompt_column, p_source, 'embed', 'generate'
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -111,6 +189,13 @@ $$ LANGUAGE plpgsql;
 -- reason as watch() — input_text is also a pgquarry.jobs column.
 CREATE OR REPLACE FUNCTION pgquarry.embed_async(p_input_text text) RETURNS bigint AS $$
     INSERT INTO pgquarry.jobs (input_text) VALUES (p_input_text) RETURNING id;
+$$ LANGUAGE sql;
+
+-- Text-typed counterpart of embed_async(). p_max_tokens defaults to NULL —
+-- the worker falls back to [worker] generation_max_tokens from pgquarry.toml
+-- (see dispatch_generate_jobs()) when a job's max_tokens is unset.
+CREATE OR REPLACE FUNCTION pgquarry.generate_async(p_input_text text, p_max_tokens int DEFAULT NULL) RETURNS bigint AS $$
+    INSERT INTO pgquarry.jobs (input_text, job_type, max_tokens) VALUES (p_input_text, 'generate', p_max_tokens) RETURNING id;
 $$ LANGUAGE sql;
 
 -- Blocks the calling backend until the job completes or timeout_ms elapses.
@@ -172,6 +257,50 @@ BEGIN
 END;
 $$;
 
+-- Text-typed counterpart of embed_sync() — same blocking-poll shape and same
+-- reasons for being a PROCEDURE with no default on p_timeout_ms (see
+-- embed_sync()'s header comment). p_max_tokens has no default either, for the
+-- same "every declared IN param needs a positional value in a top-level CALL"
+-- reason — pass NULL explicitly to fall back to pgquarry.toml's
+-- generation_max_tokens:
+--   CALL pgquarry.generate_sync('prompt text', NULL, 5000, NULL);
+CREATE OR REPLACE PROCEDURE pgquarry.generate_sync(
+    IN  p_input_text  text,
+    IN  p_max_tokens  int,
+    IN  p_timeout_ms  int,
+    OUT result_text   text
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    job_id     bigint;
+    started_at timestamptz;
+    job        pgquarry.jobs%ROWTYPE;
+BEGIN
+    job_id := pgquarry.generate_async(p_input_text, p_max_tokens);
+    COMMIT;
+    started_at := clock_timestamp();
+
+    LOOP
+        SELECT * INTO job FROM pgquarry.jobs WHERE id = job_id;
+
+        IF job.status = 'done' THEN
+            result_text := job.result_text;
+            RETURN;
+        ELSIF job.status = 'error' THEN
+            RAISE EXCEPTION 'pgquarry.generate_sync: job % failed: %', job_id, job.error;
+        END IF;
+
+        IF extract(epoch FROM clock_timestamp() - started_at) * 1000 >= p_timeout_ms THEN
+            RAISE EXCEPTION 'pgquarry.generate_sync: job % did not complete within %ms — '
+                'is pgquarry_worker running?', job_id, p_timeout_ms;
+        END IF;
+
+        PERFORM pg_sleep(0.05);
+    END LOOP;
+END;
+$$;
+
 -- CREATE EXTENSION runs as the installing role (typically a superuser), so
 -- everything above is owned by that role, not the app role the worker and
 -- ordinary client backends actually connect as (e.g. quser) — without these,
@@ -184,5 +313,8 @@ GRANT SELECT, INSERT, UPDATE ON pgquarry.watched_tables TO PUBLIC;
 GRANT USAGE, SELECT ON pgquarry.jobs_id_seq TO PUBLIC;
 GRANT EXECUTE ON FUNCTION pgquarry.enqueue_job() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION pgquarry.watch(text, text, text, text, text, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgquarry.watch_generate(text, text, text, text, text, text, text, text, text, text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION pgquarry.embed_async(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgquarry.generate_async(text, int) TO PUBLIC;
 GRANT EXECUTE ON PROCEDURE pgquarry.embed_sync(text, int) TO PUBLIC;
+GRANT EXECUTE ON PROCEDURE pgquarry.generate_sync(text, int, int) TO PUBLIC;

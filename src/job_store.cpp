@@ -49,10 +49,12 @@ std::vector<JobStore::ClaimedJob> JobStore::claim_pending(int limit)
     for (int i = 0; i < n; ++i) {
         ClaimedJob job;
         job.id = std::atoll(PQgetvalue(res, i, 0));
-        if (!PQgetisnull(res, i, 1)) job.source_table = PQgetvalue(res, i, 1);
-        if (!PQgetisnull(res, i, 2)) job.source_id    = std::atoll(PQgetvalue(res, i, 2));
-        if (!PQgetisnull(res, i, 3)) job.embed_column = PQgetvalue(res, i, 3);
+        if (!PQgetisnull(res, i, 1)) job.source_table  = PQgetvalue(res, i, 1);
+        if (!PQgetisnull(res, i, 2)) job.source_id     = std::atoll(PQgetvalue(res, i, 2));
+        if (!PQgetisnull(res, i, 3)) job.source_column = PQgetvalue(res, i, 3);
         job.input_text = PQgetvalue(res, i, 4);
+        job.job_type   = job_type_from_string(PQgetvalue(res, i, 5));
+        if (!PQgetisnull(res, i, 6)) job.max_tokens = std::atoi(PQgetvalue(res, i, 6));
         claimed.push_back(std::move(job));
     }
     PQclear(res);
@@ -71,16 +73,25 @@ std::string vector_literal(const std::vector<float>& embedding)
     vec_str << "]";
     return vec_str.str();
 }
+
+// A source_table can carry both an 'embed' and a 'generate' mapping at once
+// (pgquarry.watch() + pgquarry.watch_generate()), each needing its own
+// cached write-back SQL — hence the composite key.
+std::string cache_key(const TableMapping& m)
+{
+    return m.source + "\x1f" + m.job_type;
+}
 } // namespace
 
 void JobStore::write_back(const TableMapping& mapping, long long source_id, const std::vector<float>& embedding)
 {
-    auto it = write_back_sql_cache_.find(mapping.source);
+    auto key = cache_key(mapping);
+    auto it = write_back_sql_cache_.find(key);
     if (it == write_back_sql_cache_.end()) {
         std::string built = mapping.same_table()
             ? WritebackSqlBuilder::build_update_sql(mapping)
             : WritebackSqlBuilder::build_upsert_sql(mapping);
-        it = write_back_sql_cache_.emplace(mapping.source, std::move(built)).first;
+        it = write_back_sql_cache_.emplace(std::move(key), std::move(built)).first;
     }
 
     const std::string vec_literal = vector_literal(embedding);
@@ -97,6 +108,30 @@ void JobStore::write_back(const TableMapping& mapping, long long source_id, cons
     PQclear(res);
 }
 
+void JobStore::write_back_text(const TableMapping& mapping, long long source_id, const std::string& text)
+{
+    auto key = cache_key(mapping);
+    auto it = write_back_sql_cache_.find(key);
+    if (it == write_back_sql_cache_.end()) {
+        std::string built = mapping.same_table()
+            ? WritebackSqlBuilder::build_update_sql_text(mapping)
+            : WritebackSqlBuilder::build_upsert_sql_text(mapping);
+        it = write_back_sql_cache_.emplace(std::move(key), std::move(built)).first;
+    }
+
+    const std::string id_str = std::to_string(source_id);
+    const char* params[2] = { text.c_str(), id_str.c_str() };
+
+    PGresult* res = PQexecParams(conn_, it->second.c_str(), 2, nullptr, params, nullptr, nullptr, 0);
+    bool ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
+    if (!ok) {
+        std::string err = PQerrorMessage(conn_);
+        PQclear(res);
+        throw std::runtime_error("JobStore: write_back_text failed for " + mapping.target_table + ": " + err);
+    }
+    PQclear(res);
+}
+
 void JobStore::write_ad_hoc_result(long long id, const std::vector<float>& embedding)
 {
     const std::string vec_literal = vector_literal(embedding);
@@ -109,6 +144,21 @@ void JobStore::write_ad_hoc_result(long long id, const std::vector<float>& embed
         std::string err = PQerrorMessage(conn_);
         PQclear(res);
         throw std::runtime_error("JobStore: write_ad_hoc_result failed for job " + id_str + ": " + err);
+    }
+    PQclear(res);
+}
+
+void JobStore::write_ad_hoc_result_text(long long id, const std::string& text)
+{
+    const std::string id_str = std::to_string(id);
+    const char* params[2] = { id_str.c_str(), text.c_str() };
+
+    PGresult* res = PQexecParams(conn_, sql::kWriteAdHocResultText, 2, nullptr, params, nullptr, nullptr, 0);
+    bool ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
+    if (!ok) {
+        std::string err = PQerrorMessage(conn_);
+        PQclear(res);
+        throw std::runtime_error("JobStore: write_ad_hoc_result_text failed for job " + id_str + ": " + err);
     }
     PQclear(res);
 }
@@ -152,11 +202,12 @@ std::vector<TableMapping> JobStore::load_watched_tables()
     for (int i = 0; i < n; ++i) {
         TableMapping m;
         m.source           = PQgetvalue(res, i, 0);
-        m.id_column        = PQgetvalue(res, i, 1);
-        m.embed_column      = PQgetvalue(res, i, 2);
-        m.target_table      = PQgetvalue(res, i, 3);
-        m.target_column     = PQgetvalue(res, i, 4);
-        m.target_id_column  = PQgetvalue(res, i, 5);
+        m.job_type         = PQgetvalue(res, i, 1);
+        m.id_column        = PQgetvalue(res, i, 2);
+        m.source_column     = PQgetvalue(res, i, 3);
+        m.target_table      = PQgetvalue(res, i, 4);
+        m.target_column     = PQgetvalue(res, i, 5);
+        m.target_id_column  = PQgetvalue(res, i, 6);
         tables.push_back(std::move(m));
     }
     PQclear(res);

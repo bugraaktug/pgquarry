@@ -16,7 +16,7 @@ poll_interval_ms = 250
 # jobs will just fail with an actionable error instead of blocking startup.
 # Needs an instruct/chat-tuned GGUF (with baked-in chat_template metadata),
 # not an embedding model like the one above.
-#generation_model_path   = "/home/rockylinux/models/qwen2.5-0.5b-instruct-Q4_K_M.gguf"
+generation_model_path    = "/home/rockylinux/models/qwen2.5-0.5b-instruct/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 generation_max_tokens    = 128
 generation_n_ctx         = 2048
 generation_n_threads     = 4
@@ -27,8 +27,8 @@ purge_after    = "7d"    # delete status='done' rows older than this; omit/"0" =
 purge_verbose  = false   # when true, log id/status/created_at for every row a sweep deletes
 
 [logging]
-log_file    = "/tmp/pgquarry/worker.log"
-log_level   = "info"     # trace|debug|info|warn|error|critical|off — debug logs claim/write-back detail per job
+log_file    = "/tmp/pgquarry/worker-generate-test.log"
+log_level   = "debug"    # trace|debug|info|warn|error|critical|off — debug logs claim/write-back detail per job
 max_size_mb = 10         # rotate the active log file once it crosses this size
 max_files   = 3          # rotated files kept, oldest deleted beyond this
 
