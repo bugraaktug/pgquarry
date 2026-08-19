@@ -29,7 +29,7 @@ The worker (`pgquarry_worker`) is a separate OS process, not an in-postmaster ba
 - **`CREATE EXTENSION pgquarry;`** provisions the schema, job table, and SQL API in one step — nothing to hand-run.
 - **`pgquarry.watch(source, embed_column, ...)`** registers a trigger and a write-back mapping from SQL alone — no config file edit, no worker restart. Write-back is a same-table `UPDATE` by default, or an `UPSERT` into a separate `target_table` for a chunk/embedding-table split.
 - **`pgquarry.watch_generate(source, embed_column, embed_target_column, prompt_column, generate_target_column, ...)`** registers the same kind of trigger, but for *both* an embed and a generate job per row change in one shot — e.g. auto-fill an `embedding` column and a `summary` column from the same `INSERT`.
-- **`pgquarry.embed_async(text)` / `CALL pgquarry.embed_sync(text, timeout_ms)`** and their generation counterparts **`pgquarry.generate_async(text, max_tokens)` / `CALL pgquarry.generate_sync(text, max_tokens, timeout_ms)`** enqueue arbitrary text with no source table or trigger involved — fire-and-forget or block-and-wait, straight from SQL or application code.
+- **`pgquarry.embed_async(text)` / `CALL pgquarry.embed_sync(text, timeout_ms, NULL)`** and their generation counterparts **`pgquarry.generate_async(text, max_tokens)` / `CALL pgquarry.generate_sync(text, max_tokens, timeout_ms, NULL)`** enqueue arbitrary text with no source table or trigger involved — fire-and-forget or block-and-wait, straight from SQL or application code. The trailing `NULL` is required: Postgres's `CALL` needs a positional value for every declared parameter, including the procedure's `OUT result` param.
 - **Config-driven worker** (`pgquarry.toml`): connection info, local GGUF model path/threads/context/batch size, poll interval, log file/level/rotation, and an optional second `generation_model_path` (instruct/chat GGUF) for text generation — `generate`/`watch_generate()` jobs fail with an actionable error rather than blocking startup if it's unset.
 - **Two-stage retention**: `status='done'` job rows stick around as an audit trail until `[retention] purge_after`, then the worker purges them on its own sweep (`purge_verbose` for per-row vs. summary logging).
 - **`pg_notify('pgquarry_jobs', ...)`** fires after every batch write, so other listeners don't have to poll for completion either.
@@ -89,8 +89,10 @@ The worker (`pgquarry_worker`) is a separate OS process, not an in-postmaster ba
    -- Fire-and-forget: enqueue and move on, check back later via jobs.id
    SELECT pgquarry.embed_async('embed this later');
 
-   -- Or block until it's done (or times out)
-   CALL pgquarry.embed_sync('embed this on demand', 5000);
+   -- Or block until it's done (or times out) — the trailing NULL is required:
+   -- CALL needs a positional value for every declared parameter, including
+   -- the OUT result param
+   CALL pgquarry.embed_sync('embed this on demand', 5000, NULL);
    ```
 
 5. Generation works the same way, from a watched column or ad hoc. `watch_generate()` fills in an embedding *and* a generated column from the same row change. `prompt_column` is read verbatim as the generate job's input — no instruction wrapping happens at the SQL layer, so bake the instruction in yourself (a `GENERATED ALWAYS ... STORED` column works well):
@@ -112,7 +114,7 @@ The worker (`pgquarry_worker`) is a separate OS process, not an in-postmaster ba
 
    ```sql
    SELECT pgquarry.generate_async('Summarize this ticket in 5 words: ...');
-   CALL pgquarry.generate_sync('Summarize this ticket in 5 words: ...', NULL, 15000);
+   CALL pgquarry.generate_sync('Summarize this ticket in 5 words: ...', NULL, 15000, NULL);
    ```
 
    See [`demo/`](demo/) for a full worked example (clustering embeddings, then naming each cluster via generation).
